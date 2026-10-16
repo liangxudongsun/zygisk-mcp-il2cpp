@@ -1,10 +1,14 @@
 # Zygisk IL2CPP MCP Bridge
 
-当前服务版本：**2.7.9** · 作者：**洋葱落日 && DUM**
+当前服务版本：**2.8.3** · 作者：**洋葱落日 && DUM**
 
-2.7.9 修复原生 HTTP 中部分工具能列出却无法调用的问题，统一游戏帧路由，并保留具体错误和目标进程信息。目标内部 TCP 不可用时支持本地 Unix Socket 降级，连接配置不变。实例与集合工具同步改用完整快照计数、独立集合更新和最新按类查询，说明见 [实例与集合渲染管理](#实例与集合渲染管理)。
+新版 HTTP 和 Python 默认共用设备端的完整工具目录、具名参数、结果、错误与功能开关。原生别名继续兼容。需要同时更新手机模块和本目录。
 
-字段来源、Unicode 字符串搜索／修改、字符串交叉定位、地址到类／字段及实际内存关系链查询，以及 `debugger_breakpoint_set.on_hit` 命中寄存器修改继续保留。共享工具同时支持 Python stdio 与原生 HTTP。
+新增共享工具 `frida_script`（原生 HTTP／Python 均可）：`status / load / list / post / messages / unload / unload_all / help`，支持官方 ARM64 GumJS 的 JavaScript 执行。`material_set` 同步修复可选 API 与失败记录造成的误拦截，支持整数属性 ID 重载。
+
+2.7.9 修复原生 HTTP 中部分工具能列出却无法调用的问题，统一游戏帧路由，并保留具体错误和目标进程信息。目标内部 TCP 不可用时支持本地 Unix Socket 降级，连接配置不变。实例与集合工具同步改用完整快照计数、独立集合更新和最新按类查询。
+
+字段来源、Unicode 字符串搜索／修改、字符串交叉定位、地址到类／字段及实际内存关系链查询，以及 `debugger_breakpoint_set.on_hit` 命中寄存器修改继续保留。共享工具同时支持 Python stdio 与原生 HTTP
 
 ## 原生 HTTP 接入（不需要 Python）
 
@@ -28,23 +32,17 @@
 
 监听设置持久化到 `/data/adb/zygisk_il2cpp_mcp/mcp_listen_address.txt`，仅支持 `127.0.0.1` 或 `0.0.0.0`，缺失或非法值回到本机监听。安装器在缺失时创建默认值，升级保留已有选择。监听地址或端口变更必须重启设备：Root 网关不会随单个目标进程退出而重新绑定。
 
-远端只允许经过 Bearer 认证的 HTTP，旧 raw Socket 仍仅接受设备本机连接；下方 Python stdio 配置保持本机或 ADB 转发方式。HTTP 无 TLS，令牌与请求内容以明文传输，只在可信局域网使用，不要暴露到公网或不可信网络。
-
 远端只允许 HTTP，默认要求 Bearer 令牌；旧 raw Socket 仍仅接受设备本机连接，下方 Python stdio 配置保持本机或 ADB 转发方式。HTTP 无 TLS，令牌与请求内容以明文传输，只在可信环境使用，不要暴露到公网或不可信网络。
 
 需要免鉴权时，在 Web「MCP 连接」→「连接设置」开启「无需鉴权」并保存；本机 `127.0.0.1` 和局域网 `0.0.0.0` 均支持，不需要重启网关，客户端需重新初始化会话。此时复制的 HTTP 配置只包含 `type`、`url`，不含 `headers.Authorization`，即使没有令牌也能连接。持久化文件为 `/data/adb/zygisk_il2cpp_mcp/mcp_http_auth_required.txt`，`1` 要求鉴权，只有 `0` 关闭；文件缺失、内容非法或权限不安全时默认要求鉴权。切回鉴权后原令牌继续使用。
 
 注意：免鉴权意味着任何能连接该端口的应用或设备都可以调用已开启的工具，包括内存写入和方法调用。功能分组开关、会话、Host／Origin 和请求大小校验仍然有效，但它们不替代身份鉴权；请只在可信环境中明确开启。
 
-通用入口 `native_workspace_query` 本身不会再次入队：例如 `{"arguments":["IL2CPP_METHODS",{"text":"41 - 42 - 16"}]}` 只生成一层 `WORKSPACE_QUERY`。优先使用对应的具名工具，避免手工拼接编码。关系链实时加载和托管字符串修改也会在游戏帧交给各自的处理器执行。
-
-若工具列表中有命令但调用失败，错误返回会保留具体原因，并在 `structuredContent` 附带工具名、原生命令、目标进程及 `error_stage`：`tool_lookup` 表示当前 HTTP 工具名不存在，`target_call` 表示目标调用失败，`game_frame` 表示排队后的执行失败。`native_workspace_result` 在仍等待时不是错误，执行完成且失败时会设置 MCP `isError=true`，保留请求 ID 和原始错误，不自动重试。Unity API 不可用不再统一报成“命令不可用”。更新模块后按安装要求重启设备，再刷新客户端工具列表；旧网关或尚未重启的目标不会自动获得新命令。
-
 HTTP 同时提供共享的具名参数工具和原生命令工具，尚不是整套 Python 工具的一比一替换：
 
 - `process_list`、`process_select`、`process_current`：查看和选择进程；每个 HTTP MCP 会话独立，目标退出后不会自动切换。
 - `ping`、`runtime_capabilities`、`debug_help`、`raw_hook_call`：健康检查、兼容能力、帮助和单条原生命令调用。
-- `memory_read`、`memory_write`、`analyze_function`、字符串／引用／调用关系、暂停调试与 `il2cpp_symbols_*` 等共享工具：使用与 Python stdio 相同的工具名和具名参数，不需要手工编码原生命令。
+- 全部原有具名工具，包括 IL2CPP、材质、渲染、内存类型转换、指针链和输入等待：使用与 Python stdio 相同的工具名和参数，不需要手工编码原生命令。
 - `native_…`：从原生 HELP 共享目录生成工具，覆盖 IL2CPP、内存、调试、渲染、UI、项目及关系链等。用 `debug_help {"command":"MEMORY_READ"}` 或完整工具名查看真实参数语法。
 - 位置参数放入 `arguments` 数组；字面值直接传，`{"text":"…"}` 自动转成 UTF-8 hex，`{"json":{…}}` 自动转成 JSON hex。原本只接受一个 JSON 参数的工具直接传 `payload`。64 位地址请使用 `"0x…"` 字符串，避免 JSON 数值精度丢失。
 
@@ -62,11 +60,15 @@ analyze_function {"address":"0x12340000","decompile":false}
 
 Unity／对象检查和精确托管调用工具自动进入原有游戏帧队列，返回请求 ID 不代表执行完成。继续调用 `native_workspace_result {"arguments":[请求ID]}`，检查 `pending`、`success` 和 `error`，不要重复提交写操作。工具说明中使用 `WORKSPACE_QUERY … <argsHex>` 时，HTTP 工具的 `arguments` 填的是说明中 Args 对应的内层参数，服务器负责外层编码。
 
+通用入口 `native_workspace_query` 本身不会再次入队：例如 `{"arguments":["IL2CPP_METHODS",{"text":"41 - 42 - 16"}]}` 只生成一层 `WORKSPACE_QUERY`。优先使用对应的具名工具，避免手工拼接编码。关系链实时加载和托管字符串修改也会在游戏帧交给各自的处理器执行。
+
+若工具列表中有命令但调用失败，错误返回会保留具体原因，并在 `structuredContent` 附带工具名、原生命令、目标进程及 `error_stage`：`tool_lookup` 表示当前 HTTP 工具名不存在，`target_call` 表示目标调用失败，`game_frame` 表示排队后的执行失败。`native_workspace_result` 在仍等待时不是错误，执行完成且失败时会设置 MCP `isError=true`，保留请求 ID 和原始错误，不自动重试。Unity API 不可用不再统一报成“命令不可用”。更新模块后按安装要求重启设备，再刷新客户端工具列表；旧网关或尚未重启的目标不会自动获得新命令。
+
 HTTP 的共享具名工具直接在原生服务中提供，无需启动 Python。反汇编、反编译、静态分析、文件导出和 `native_library_upload` 分块上传均可使用；能力是否可用以目标返回为准。HTTP 无法读取电脑路径，上传字节由客户端提供，电脑本地文件辅助仍可使用下方 Python stdio 服务。原生 HTTP 的分组开关在模块 Web「功能开关」管理；HTTP 也可在「MCP 连接」页整体关闭，关闭后不会影响旧 Socket 服务。
 
-Web 分组配置保存到 `/data/adb/zygisk_il2cpp_mcp/mcp_features.json`，默认全部开启。保存后下次请求生效，禁用工具会从 `tools/list` 隐藏，直接调用和原始命令也会经过分组检查；客户端可能需要刷新工具列表或重新连接。Python stdio 的浏览器管理器控制其自己的本地配置，两个入口不会自动同步。管理接口不注册为 Agent 工具，关闭分组不会自动撤销已开始的任务，也不等于目标内脚本的安全隔离。
+Web 分组配置保存到 `/data/adb/zygisk_il2cpp_mcp/mcp_features.json`，默认全部开启。新版 Python 的浏览器管理器和手机 Web 共用此配置，禁用工具从两条连接的目录隐藏，直接调用也会检查。Python 发送工具变化通知，HTTP 支持初始化后的 `GET /mcp` SSE 通知（不是旧 `/sse` 接口）；未监听事件的客户端需手动刷新工具或重连。管理接口不注册为 Agent 工具，关闭分组不自动撤销已开始任务，也不是脚本安全沙箱。
 
-安装器生成独立随机令牌，升级保留，文件为 `/data/adb/zygisk_il2cpp_mcp/mcp_http_token.txt`，Root 所有、0600 权限；切勿把完整配置发到公开反馈。令牌缺失拒绝访问。替换令牌后，旧会话失效，需要重新初始化。会话闲置一小时后过期，同时最多 128 个；初始化响应返回 `MCP-Session-Id`，后续请求携带该头和协商的 `MCP-Protocol-Version`。
+安装器生成独立随机令牌，升级保留，文件为 `/data/adb/zygisk_il2cpp_mcp/mcp_http_token.txt`，Root 所有、0600 权限；切勿把带令牌的配置发到公开反馈。鉴权开启时令牌缺失拒绝访问。替换令牌或切换鉴权模式后，旧会话失效，需要重新初始化。会话闲置一小时后过期，同时最多 128 个；初始化响应返回 `MCP-Session-Id`，后续请求携带该头和协商的 `MCP-Protocol-Version`。
 
 传输遵循 [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) 的 JSON 响应模式：POST `/mcp`、`Content-Type: application/json`、`Accept: application/json, text/event-stream`，当前支持 2025-06-18／2025-11-25 协议；GET 返回 405，通知返回 202，DELETE 结束会话。每次 POST 携带单个 JSON-RPC 消息及 `Content-Length`，不接受 chunked 上传或旧协议批处理。HTTP 请求头上限 32 KiB、请求体 1 MiB、原生返回 4 MiB；大结果请分页或导出文件。连接丢失不会重放命令；关闭会话／取消通知不会撤销已经开始的目标操作。
 
@@ -101,7 +103,7 @@ Web「目标设置」→「启动设置」→「延迟启动（秒）」填 0–
 - `logic_program_*`：自定义函数、有界循环、集合运算与显式开启的带参托管调用。
 - 原有资源、内存、断点、日志与项目工具继续保留；每项用法可通过 `debug_help` 查询。
 
-新兼容路径和复杂加载场景仍需更多设备验证。自定义 SO 会在目标进程执行，不具备反编译工作进程的隔离能力；
+新兼容路径和复杂加载场景仍需更多设备验证。自定义 SO 会在目标进程执行，不具备反编译工作进程的隔离能力。
 
 以下是保留的 Python stdio MCP Server，仅依赖标准库。它连接本地 Socket（可按需通过 ADB 转发），并把 IL2CPP、普通 Native 内存、LuaJIT、Dobby、汇编和断点能力暴露为 MCP tools。
 
@@ -127,7 +129,7 @@ python mcp/mcp_server.py --port 27184 --direct
 
 方法查询诊断：方法查询可自动回传执行阶段，断开时 MCP 错误中包含 `last_native_stage`，无需手工抓 logcat。此项需要新版模块配合；旧模块仍按原查询协议工作。
 
-Python stdio 服务还会启动独立的浏览器控制页面，默认地址是 `http://127.0.0.1:27185/`。所有功能开关第一次启动时全部开启，页面修改会立即影响该 Python 服务的 `tools/list`，并默认保存到 `mcp/mcp_features.json`。原生 HTTP 使用上面的手机 Web「功能开关」，不需要启动这个 Python 管理器。Python 可用参数：
+Python stdio 服务还会启动浏览器控制页面，默认地址是 `http://127.0.0.1:27185/`。新版默认读取和修改手机 Web 的同一份功能开关；电脑原有 `mcp_features.json` 不会自动覆盖手机设置。只有旧模块回退或显式 `--legacy-tools` 才使用本地配置。未连接时可查看缓存／旧目录，实际操作仍需连接设备。Python 可用参数：
 
 ```text
 --admin-host 127.0.0.1
@@ -135,6 +137,7 @@ Python stdio 服务还会启动独立的浏览器控制页面，默认地址是 
 --admin-token <token>
 --no-admin
 --feature-config <json-path>
+--legacy-tools
 ```
 
 非回环管理地址必须设置令牌。功能读取、单项切换和全部切换只存在于浏览器管理 API，不注册为 MCP tools，因此 Agent 无法看到或调用管理接口。被禁用的工具不会返回给 Agent，`raw_hook_call` 也不能绕过开关；关闭全部功能后仍可通过浏览器页面恢复。
@@ -302,7 +305,7 @@ files/zygisk_il2cpp_mcp/il2cpp_dump_<随机后缀>.cs
 
 显示走已有 Java SurfaceView，不 Hook EGL。Java 菜单启动后自动探测已加载 IL2CPP 的 MonoBehaviour 帧方法；检查 `render_binding_status` 的 automatic/auto_error/automatic_probes、thread_id 和 age_ms。探测失败保留普通内存/类型工具；先解除自动探针后仍可通过 `render_bind_update` 手动绑定。`render_find_objects` 返回受理状态，需要轮询结果。普通目标可提供手动坐标、骨骼和相机矩阵；对象操作只改变可视化，不销毁或移动游戏对象。
 
-每条命令可通过 `debug_help` 查询 新工具需要同时更新设备模块与整个 MCP 目录（包括 `render_tools.py`），不能只替换 `mcp_server.py`。
+每条命令可通过 `debug_help` 查询。新工具需要同时更新设备模块与整个 MCP 目录（包括 `render_tools.py`），不能只替换 `mcp_server.py`。
 
 矩阵被裁剪时使用 WorldToScreenPoint；此模式的 `render_project` 返回 pending/request_id，通过 `render_projection_result` 获取结果。所有 Unity 投影仍在游戏帧执行。
 
@@ -452,7 +455,7 @@ WebUI 恢复驱动和设备节点设置，保存后重启目标。驱动由外�
 
 ### 外部暂停调试器
 
-暂停调试器由目标进程外的 Root companion 执行，只允许启动时已绑定的目标 PID，与上面的 perf 采样断点互相独立。新增字段来源、字符串和地址关系，这些共享工具同时提供 Python stdio 和原生 HTTP MCP：
+暂停调试器由目标进程外的 Root companion 执行，只允许启动时已绑定的目标 PID，与上面的 perf 采样断点互相独立。这些共享工具同时提供 Python stdio 和原生 HTTP MCP：
 
 - `debugger_status`：查询 ARM64 支持、拥有的暂停线程、租约和清理状态；状态可用不代表 ptrace 权限已经通过，权限只在实际暂停时确认。
 - `debugger_threads`：分页枚举固定目标的线程，同时返回用于抵抗 TID 重用的 `thread_start_time`；当前请求线程不能由此通道暂停。
@@ -488,7 +491,7 @@ Python 工具 `render_find_objects`／`render_track_class` 默认 `include_inact
 
 `logic_program_schema/validate/set/list/get/control/remove` 提供独立于 Lua 的通用 JSON 逻辑运行时。AI 通过 MCP 查询语法并提交变量、条件、遍历、动态对象源、字段读取及绘制/UI 变量输出；目标游戏的字段、筛选规则和窗口布局由调用方下发，底层不预装业务程序。
 
-原生界面的“AI 逻辑”页可编辑、校验、启停和查看诊断。设置 `auto_start=true` 后保存 `default` 工作区预设，可在下次启动重新解析对象源。当前不支持原生逻辑中的方法调用、字段写入或 Hook。
+原生界面的“AI 逻辑”页可编辑、校验、启停和查看诊断。设置 `auto_start=true` 后保存 `default` 工作区预设，可在下次启动重新解析对象源。
 
 ## Help 与兼容性
 

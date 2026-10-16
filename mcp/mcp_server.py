@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -22,15 +23,16 @@ from urllib.parse import urlparse
 
 if __package__:
     from . import (render_tools, workspace_tools, debug_tools, logic_tools,
-                   relationship_tools, paused_debug_tools, task_tools, workflow_tools, native_library_tools, analysis_tools)
+                   relationship_tools, paused_debug_tools, task_tools, workflow_tools, native_library_tools, analysis_tools, native_transport)
 else:
     import render_tools, workspace_tools, debug_tools, logic_tools
     import relationship_tools, paused_debug_tools, task_tools, workflow_tools, native_library_tools
     import analysis_tools
+    import native_transport
 
 
 SERVER_NAME = "zygisk-il2cpp-mcp"
-SERVER_VERSION = "2.7.9"
+SERVER_VERSION = "2.8.3"
 LATEST_PROTOCOL = "2025-11-25"
 SUPPORTED_PROTOCOLS = {
     "2024-11-05",
@@ -74,7 +76,25 @@ class FeatureRegistry:
         self._states = {name: True for name in FEATURES}
         self._config_path = Path(config_path).expanduser() if config_path else None
         self._listeners: list[Callable[[], None]] = []
+        self._remote = None
         self._load()
+
+    def bind_remote(self, transport) -> None:
+        self._remote = transport
+        self._remote_catalog_signature=tuple(t["name"] for t in TOOLS)
+
+    def refresh_remote(self, force=False) -> None:
+        if self._remote is None:return
+        info=self._remote.info(force=force)
+        if info is None:return
+        states={name:bool(info["features"].get(name,True)) for name in FEATURES}
+        if "_invalid" in info["features"]:states={name:False for name in FEATURES}
+        with self._lock:
+            signature=tuple(t["name"] for t in info["tools"])
+            changed=states!=self._states or signature!=self._remote_catalog_signature;self._states=states
+            self._remote_catalog_signature=signature
+            listeners=list(self._listeners) if changed else []
+        for listener in listeners:listener()
 
     def _load(self) -> None:
         if not self._config_path or not self._config_path.is_file():
@@ -121,6 +141,9 @@ class FeatureRegistry:
             raise BridgeError(f"unknown MCP feature: {name}")
         if not isinstance(enabled, bool):
             raise BridgeError("enabled must be a boolean")
+        if self._remote is not None and self._remote.info() is not None:
+            previous=self._states[name];self._remote.features({name:enabled});self.refresh_remote()
+            return {"feature":name,"enabled":enabled,"changed":previous!=enabled,"source":"device_web"}
         with self._lock:
             changed = self._states[name] != enabled
             self._states[name] = enabled
@@ -134,6 +157,9 @@ class FeatureRegistry:
     def set_all(self, enabled: bool) -> dict[str, Any]:
         if not isinstance(enabled, bool):
             raise BridgeError("enabled must be a boolean")
+        if self._remote is not None and self._remote.info() is not None:
+            changed=any(v!=enabled for v in self._states.values());self._remote.features({name:enabled for name in FEATURES});self.refresh_remote()
+            return {"enabled":enabled,"changed":changed,"feature_count":len(FEATURES),"source":"device_web"}
         with self._lock:
             changed = any(value != enabled for value in self._states.values())
             for name in self._states:
@@ -146,8 +172,13 @@ class FeatureRegistry:
         return {"enabled": enabled, "changed": changed, "feature_count": len(self._states)}
 
     def snapshot(self) -> dict[str, Any]:
+        sync_error=None
+        try:self.refresh_remote()
+        except Exception as exc:sync_error=str(exc)
         with self._lock:
             return {
+                "source":"device_web" if self._remote and not self._remote._legacy else "local_legacy",
+                "sync_error":sync_error,
                 "default_enabled": True,
                 "features": [
                     {
@@ -215,8 +246,8 @@ class HookSocketClient:
         raise BridgeError("hook service returned an oversized response header")
 
     @staticmethod
-    def _recv_exact(sock: socket.socket, length: int) -> bytes:
-        if length < 0 or length > MAX_BODY_BYTES:
+    def _recv_exact(sock: socket.socket, length: int, *, maximum: int = MAX_BODY_BYTES) -> bytes:
+        if length < 0 or length > maximum:
             raise BridgeError("hook service returned an invalid response length")
         data = bytearray()
         while len(data) < length:
@@ -231,8 +262,10 @@ class HookSocketClient:
         command = _single_line(command, "command").strip()
         if not command:
             raise BridgeError("command cannot be empty")
-        command_limit = (8*1024*1024+64 if command.startswith("WORKSPACE_BROWSER ") else
-                         160*1024 if command.startswith("NATIVE_LIBRARY_CONTROL ") else 64*1024)
+        command_limit = (8*1024*1024+32768 if command.startswith(("WORKSPACE_BROWSER ","MCP_NAMED_CALL_V1 ")) else
+                         512*1024+64 if command.startswith("LUA_EXEC ") else
+                         160*1024 if command.startswith("NATIVE_LIBRARY_CONTROL ") else
+                         256*1024)
         if len(command.encode("utf-8")) > command_limit:
             raise BridgeError("command is too long")
 
@@ -305,7 +338,8 @@ class HookSocketClient:
                     body_length = int(header[3:].strip())
                 except ValueError as exc:
                     raise BridgeError(f"invalid hook response header: {header!r}") from exc
-                return self._recv_exact(sock, body_length).decode("utf-8", errors="strict").rstrip("\n")
+                maximum=32*1024*1024 if command.startswith("MCP_NAMED_CALL_V1 ") else MAX_BODY_BYTES
+                return self._recv_exact(sock, body_length,maximum=maximum).decode("utf-8", errors="strict").rstrip("\n")
         except BridgeError as exc:
             if last_stage is not None:
                 raise BridgeError(f"{command.split()[0]}: {exc}; last_native_stage="
@@ -1571,7 +1605,20 @@ TOOLS.extend(native_library_tools.TOOLS)
 _existing_names = {t["name"] for t in TOOLS}
 TOOLS.extend(t for t in analysis_tools.TOOLS if t["name"] not in _existing_names)
 TOOLS = [analysis_tools.BY_NAME.get(t["name"], t) for t in TOOLS]
+# Native JSON numbers (and many MCP clients) cannot preserve integer IDs beyond
+# 2**53-1. Exact addresses/uint64 bits already have string-based interfaces.
+def _safe_schema_integers(value):
+    if isinstance(value,dict):
+        kind=value.get("type",[])
+        if kind=="integer" or isinstance(kind,list) and "integer" in kind:
+            if "maximum" in value:value["maximum"]=min(value["maximum"],2**53-1)
+            if "minimum" in value:value["minimum"]=max(value["minimum"],-(2**53-1))
+        for child in value.values():_safe_schema_integers(child)
+    elif isinstance(value,list):
+        for child in value:_safe_schema_integers(child)
+for _definition in TOOLS:_safe_schema_integers(_definition.get("inputSchema",{}))
 TOOL_BY_NAME = {tool["name"].lower(): tool for tool in TOOLS}
+LEGACY_TOOLS = list(TOOLS)
 
 
 def tool_features(name: str) -> tuple[str, ...]:
@@ -1839,6 +1886,7 @@ class ToolDispatcher:
         self,
         config: ConnectionConfig,
         registry: FeatureRegistry | None = None,
+        native_tools: bool = False,
     ):
         config.validate()
         self.config = config
@@ -1846,6 +1894,24 @@ class ToolDispatcher:
         self._lock = threading.RLock()
         self._call_context = threading.local()
         self._input_lock = threading.RLock()
+        self.native_transport = native_transport.NativeTransport(self._native_request) if native_tools else None
+        if self.native_transport:self.registry.bind_remote(self.native_transport)
+
+    def _native_request(self, command: str, *, timeout: float) -> str:
+        config=getattr(self._call_context,"config",self.config)
+        return HookSocketClient(config).call(command,timeout=timeout,_process_routing=False)
+
+    def tool_catalog(self):
+        if self.native_transport:
+            try:info=self.native_transport.info()
+            except (BridgeError,OSError):
+                # Offline discovery remains usable; actual calls still use the
+                # device authority, with no mutation fallback/replay.
+                return self.native_transport._info["tools"] if self.native_transport._info else tools_for_registry(self.registry)
+            if info is not None:
+                self.registry.refresh_remote()
+                return info["tools"]
+        return tools_for_registry(self.registry)
 
     def _client(self) -> HookSocketClient:
         config = getattr(self._call_context, "config", self.config)
@@ -1875,6 +1941,26 @@ class ToolDispatcher:
         }
 
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.native_transport and name=="native_library_inject":
+            self.registry.refresh_remote()
+        if self.native_transport and name not in {"configure_connection","connection_info","native_library_inject"}:
+            info=self.native_transport.info()
+            if info is not None:
+                if not isinstance(arguments,dict):raise BridgeError("tool arguments must be an object")
+                with self._lock:config=replace(self.config)
+                previous=getattr(self._call_context,"config",None);self._call_context.config=config
+                try:result=self.native_transport.call(name,arguments,config.target_session if name!="process_select" and name!="process_list" else None)
+                finally:
+                    if previous is None:del self._call_context.config
+                    else:self._call_context.config=previous
+                data=result.get("structuredContent",{})
+                target=data.get("target_process")
+                if isinstance(target,dict) and not result.get("isError"):
+                    with self._lock:
+                        if ((self.config.host,self.config.port,self.config.adb_serial)==(config.host,config.port,config.adb_serial)
+                                and (name=="process_select" or self.config.target_session is None)):
+                            self.config=replace(self.config,target_session=target.get("session"),target_process=target)
+                return result
         methods: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "ping": self.ping,
             "connection_info": self.connection_info,
@@ -2016,6 +2102,15 @@ class ToolDispatcher:
 
     def _native_library_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
+            if self.native_transport and self.native_transport.info() is not None:
+                def remote(command, **kwargs):
+                    config=getattr(self._call_context,"config",self.config)
+                    response=self.native_transport.call("raw_hook_call",{"command":command},config.target_session)
+                    if response.get("isError"):raise BridgeError(response["content"][0]["text"])
+                    data=response["structuredContent"]
+                    if isinstance(data.get("target_process"),dict):self._remember_target(config,data["target_process"])
+                    return data
+                return native_library_tools.execute(name,arguments,remote)
             return native_library_tools.execute(name, arguments, self._json_call)
         except (ValueError, OSError) as exc:
             raise BridgeError(str(exc)) from exc
@@ -2213,6 +2308,7 @@ class ToolDispatcher:
             candidate.target_session = None
             candidate.target_process = None
         self.config = candidate
+        if self.native_transport:self.native_transport.reset()
         return self._info(candidate)
 
     def get_clipboard(self, _: dict[str, Any]) -> dict[str, Any]:
@@ -3420,13 +3516,14 @@ class McpServer:
 
     @staticmethod
     def _tool_result(value: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
-        text = value.get("error") if is_error else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(value,native_transport.NativeToolResult):return dict(value)
+        is_error = is_error or (value.get("pending") is False and value.get("success") is False)
+        text = (value.get("error") or "WORKSPACE_EXECUTION_FAILED") if is_error else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         result: dict[str, Any] = {
             "content": [{"type": "text", "text": str(text)}],
             "isError": is_error,
         }
-        if not is_error:
-            result["structuredContent"] = value
+        result["structuredContent"] = value
         return result
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -3461,7 +3558,8 @@ class McpServer:
         if method == "ping":
             return self._success(request_id, {})
         if method == "tools/list":
-            return self._success(request_id, {"tools": tools_for_registry(self.registry)})
+            try:return self._success(request_id, {"tools": self.dispatcher.tool_catalog()})
+            except Exception as exc:return self._error(request_id,-32000,str(exc))
         if method == "tools/call":
             params = message.get("params") or {}
             if not isinstance(params, dict):
@@ -3479,6 +3577,13 @@ class McpServer:
 
     def run_stdio(self) -> None:
         self._stdio_active = True
+        stop_updates=threading.Event()
+        def poll_features():
+            while not stop_updates.wait(1.0):
+                try:self.registry.refresh_remote(force=True)
+                except Exception:pass # A disconnected target is reported by the next explicit call.
+        watcher=threading.Thread(target=poll_features,name="mcp-feature-updates",daemon=True)
+        if self.dispatcher.native_transport:watcher.start()
         slots = threading.BoundedSemaphore(16)
         input_slots = threading.BoundedSemaphore(4)
 
@@ -3521,6 +3626,7 @@ class McpServer:
                         self._write_message(response)
         finally:
             self._stdio_active = False
+            stop_updates.set()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -3528,6 +3634,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default=os.environ.get("ZYGISK_MCP_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("ZYGISK_MCP_PORT", "27184")))
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("ZYGISK_MCP_TIMEOUT", "5")))
+    parser.add_argument("--legacy-tools",action="store_true",help="Use old local Python encoders/config instead of the device's unified tool service")
     parser.add_argument("--adb", default=os.environ.get("ADB", "adb"), help="ADB executable path")
     parser.add_argument("--serial", default=os.environ.get("ANDROID_SERIAL"), help="ADB device serial")
     parser.add_argument("--no-adb-forward", action="store_true", help="Do not create adb forward automatically")
@@ -3572,6 +3679,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
     registry = FeatureRegistry(args.feature_config)
+    dispatcher=ToolDispatcher(config,registry,native_tools=not args.legacy_tools)
     if not args.no_admin:
         try:
             admin = McpAdminServer(registry, args.admin_host, args.admin_port, args.admin_token)
@@ -3579,7 +3687,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"MCP browser control: {admin.url}", file=sys.stderr)
         except (BridgeError, OSError) as exc:
             print(f"MCP browser control disabled: {exc}", file=sys.stderr)
-    McpServer(ToolDispatcher(config, registry)).run_stdio()
+    McpServer(dispatcher).run_stdio()
     return 0
 
 

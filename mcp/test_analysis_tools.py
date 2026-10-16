@@ -6,6 +6,18 @@ except ImportError:
     import analysis_tools as a, mcp_server as s, paused_debug_tools as p
 
 class AnalysisTools(unittest.TestCase):
+    def test_frida_javascript_shared_wire_and_validation(self):
+        for args in ({"op":"status"}, {"op":"load","source":"send({pid: Process.id});","duration_ms":0},
+                     {"op":"post","id":1,"message":"{\"type\":\"input\"}","data_hex":"0001ff"},
+                     {"op":"messages","id":1,"after_sequence":"18446744073709551615","limit":64},
+                     {"op":"unload","id":1}, {"op":"help"}):
+            command,payload=self.payload("frida_script",args)
+            self.assertEqual(command,"FRIDA_SCRIPT_CONTROL")
+            self.assertEqual(payload,args)
+        self.assertEqual(a.features("frida_script"),("frida",))
+        for args in ({"op":"eval"},{"op":"load","source":"x"*49153}, {"id":True}, {"data_hex":"0g"}, {"duration_ms":-1}, {"pid":123}):
+            with self.assertRaises(ValueError):a.encode("frida_script",args)
+
     def payload(self, name, args):
         command, data = a.encode(name, args).split(" ", 1)
         return command, json.loads(bytes.fromhex(data))
